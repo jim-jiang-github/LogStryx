@@ -1,0 +1,83 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="description" content="A cross-platform log analysis workbench for fast search, powerful filtering, and AI-assisted troubleshooting." />
+    <title>LogStryx · 智能日志检索</title>
+    <link rel="stylesheet" href="./style.css" />
+    <script src="./main.js" defer></script>
+  </head>
+  <body>
+    <main class="app">
+      <header class="page-header">
+        <div>
+          <p class="eyebrow">LOGSTRYX · CROSS-PLATFORM LOG WORKBENCH</p>
+          <h1>LogStryx</h1>
+          <p class="subtitle">跨平台智能日志检索与分析</p>
+        </div>
+        <div class="header-actions">
+          <button id="loadFiles" class="button secondary" type="button">选择两个日志文件</button>
+          <button id="loadDemo" class="button primary" type="button">载入 100 万条演示</button>
+        </div>
+      </header>
+
+      <section class="metrics" aria-label="性能统计">
+        <div class="metric"><span>合并记录</span><strong id="totalCount">—</strong></div>
+        <div class="metric"><span>筛选结果</span><strong id="matchedCount">—</strong></div>
+        <div class="metric"><span>读取与合并</span><strong id="loadTime">—</strong></div>
+        <div class="metric"><span>当前筛选</span><strong id="filterTime">—</strong></div>
+        <div class="metric"><span>页面行数</span><strong id="renderedCount">0</strong></div>
+      </section>
+
+      <section class="log-panel" aria-label="合并后的日志">
+        <div class="filters">
+          <div class="search-field">
+            <label class="sr-only" for="keyword">关键字筛选并高亮</label>
+            <div class="search-box">
+              <input id="keyword" type="search" placeholder="搜索日志并高亮" autocomplete="off" />
+              <div class="search-options" role="group" aria-label="搜索选项">
+                <button class="search-option" type="button" data-option="matchCase" aria-label="区分大小写" title="区分大小写 (Aa)" aria-pressed="false">Aa</button>
+                <button class="search-option" type="button" data-option="wholeWord" aria-label="全词匹配" title="全词匹配 (ab)" aria-pressed="false">ab</button>
+                <button class="search-option" type="button" data-option="useRegex" aria-label="使用正则表达式" title="使用正则表达式 (.*)" aria-pressed="false">.*</button>
+              </div>
+            </div>
+          </div>
+          <label class="select-field">
+            <span class="sr-only">按级别筛选</span>
+            <select id="levelFilter">
+              <option value="ALL">全部级别</option>
+              <option value="INFO">信息</option>
+              <option value="WARN">警告</option>
+              <option value="ERROR">错误</option>
+              <option value="DEBUG">调试</option>
+              <option value="TRACE">跟踪</option>
+            </select>
+          </label>
+          <label class="select-field source-select">
+            <span class="sr-only">按文件筛选</span>
+            <select id="sourceFilter">
+              <option value="-1">两个文件</option>
+            </select>
+          </label>
+          <span id="fileSummary" class="file-summary">等待载入两个文件</span>
+        </div>
+
+        <div class="list-header" aria-hidden="true">
+          <span>时间</span><span>级别</span><span>文件</span><span>日志内容</span>
+        </div>
+        <div id="listViewport" class="list-viewport" role="list" aria-label="日志记录">
+          <div id="virtualSpace" class="virtual-space"></div>
+          <div id="virtualRows" class="virtual-rows"></div>
+          <div id="emptyState" class="empty-state">正在准备日志数据…</div>
+        </div>
+      </section>
+
+      <footer class="page-footer">
+        <span id="statusDot" class="status-dot" aria-hidden="true"></span>
+        <span id="statusText" role="status" aria-live="polite">启动百万条双文件演示…</span>
+        <span class="footer-note">每次只渲染可见行；关键字会在结果中高亮</span>
+      </footer>
+    </main>
+  </body>
+</html>
