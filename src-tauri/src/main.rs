@@ -1,7 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use regex::{Regex, RegexBuilder};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::{
     cmp::Ordering,
     fs::File,
@@ -12,7 +12,257 @@ use std::{
 };
 use tauri::State;
 
-const DEMO_RECORDS_PER_FILE: usize = 500_000;
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ReadingRule {
+    id: String,
+    name: String,
+    pattern: String,
+    time_format: String,
+    sample: String,
+}
+
+#[tauri::command]
+fn default_reading_rules() -> Vec<ReadingRule> {
+    vec![
+        ReadingRule {
+            id: "date-first".into(),
+            name: "普通日期日志".into(),
+            pattern: r"^(?P<time>\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}(?:\.\d+)?Z?)[ \t]+(?:\[?(?P<level>TRACE|DEBUG|INFO|WARN|WARNING|ERROR|FATAL)(?:\][ \t]*|[ \t]+|$))?(?P<message>.*)$".into(),
+            time_format: "%Y-%m-%d%[ T]%H:%M:%S%[.f]%[Z]".into(),
+            sample: "2026-11-06 13:06:40.045 INFO [54528] Configuring API with {\n   \"discoverIntervalMs\": 4000\n}".into(),
+        },
+        ReadingRule {
+            id: "jabra-sdk".into(),
+            name: "JabraSDK 日志".into(),
+            pattern: r"^\[(?P<time>\d{2}:\d{2}:\d{2}:\d{3}[+-]\d{4}[ \t]+\d{4}-\d{2}-\d{2})[ \t]+(?P<level>TRACE|DEBUG|INFO|WARN|WARNING|ERROR|FATAL)\](?P<message>.*)$".into(),
+            time_format: "%H:%M:%S:%f%z %Y-%m-%d".into(),
+            sample: "Initializing logger LIBJABRA_TRACE_LEVEL: INFO\n[11:45:06:469+0800 2026-11-06    INFO](t30380): SDK version".into(),
+        },
+        ReadingRule {
+            id: "jabra-direct".into(),
+            name: "Jabra Direct 日志".into(),
+            pattern: r"^\[(?P<time>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d{3})\][ \t]+\[(?P<level>(?i:TRACE|DEBUG|INFO|WARN|WARNING|ERROR|FATAL))\][ \t]*(?P<message>.*)$".into(),
+            time_format: "%Y-%m-%d %H:%M:%S.%f".into(),
+            sample: "[2026-11-06 11:34:55.197] [info] [\n  'Service',\n  { status: 'started' }\n]\n[2026-11-06 11:35:01.664] [error] TypeError: A number was expected\n    at example.js:1:1".into(),
+        },
+    ]
+}
+
+fn compile_time_format(format: &str) -> Result<Regex, String> {
+    let tokens = [
+        ("%[ T]", "[ T]"),
+        ("%[.f]", r"(?:\.(?P<f>\d{1,9}))?"),
+        ("%[Z]", "Z?"),
+        ("%Y", r"(?P<Y>\d{4})"),
+        ("%m", r"(?P<m>\d{2})"),
+        ("%d", r"(?P<d>\d{2})"),
+        ("%H", r"(?P<H>\d{2})"),
+        ("%M", r"(?P<M>\d{2})"),
+        ("%S", r"(?P<S>\d{2})"),
+        ("%f", r"(?P<f>\d{1,9})"),
+        ("%z", r"(?P<z>[+-]\d{4})"),
+        ("%%", "%"),
+    ];
+    let mut remaining = format;
+    let mut pattern = String::from("^");
+    while !remaining.is_empty() {
+        if remaining.starts_with('%') {
+            let (token, expression) = tokens
+                .iter()
+                .find(|(token, _)| remaining.starts_with(token))
+                .ok_or_else(|| format!("不支持的时间格式标记：{remaining}"))?;
+            pattern.push_str(expression);
+            remaining = &remaining[token.len()..];
+        } else {
+            let ch = remaining.chars().next().expect("non-empty format");
+            if ch == ' ' {
+                pattern.push_str("[ \\t]+");
+            } else {
+                pattern.push_str(&regex::escape(&ch.to_string()));
+            }
+            remaining = &remaining[ch.len_utf8()..];
+        }
+    }
+    pattern.push('$');
+    let regex = Regex::new(&pattern).map_err(|error| format!("时间格式无效：{error}"))?;
+    for field in ["Y", "m", "d", "H", "M", "S"] {
+        if !regex.capture_names().flatten().any(|name| name == field) {
+            return Err(format!("时间格式缺少 %{field}"));
+        }
+    }
+    Ok(regex)
+}
+
+struct CompiledRule {
+    header: Regex,
+    time: Regex,
+}
+
+fn compile_rule(rule: &ReadingRule) -> Result<CompiledRule, String> {
+    if rule.id.trim().is_empty() || rule.name.trim().is_empty() {
+        return Err("规则 ID 和名称不能为空".into());
+    }
+    Ok(CompiledRule {
+        header: compile_reading_rule(&rule.pattern)?,
+        time: compile_time_format(&rule.time_format)?,
+    })
+}
+
+#[tauri::command]
+fn validate_reading_rules(rules: Vec<ReadingRule>) -> Result<(), String> {
+    if rules.is_empty() {
+        return Err("至少保留一条读取规则".into());
+    }
+    let mut ids = std::collections::HashSet::new();
+    for rule in &rules {
+        if !ids.insert(&rule.id) {
+            return Err(format!("规则 ID 重复：{}", rule.name));
+        }
+        let compiled = compile_rule(rule).map_err(|error| format!("{}：{error}", rule.name))?;
+        if !rule.sample.trim().is_empty() {
+            read_records(std::io::Cursor::new(&rule.sample), 0, &compiled)
+                .map_err(|error| format!("{}：{error}", rule.name))?;
+        }
+    }
+    Ok(())
+}
+
+fn compile_reading_rule(pattern: &str) -> Result<Regex, String> {
+    if !pattern.starts_with('^') || !pattern.ends_with('$') {
+        return Err("正则必须以 ^ 开始、以 $ 结束，逐行匹配日志头".into());
+    }
+    let regex = Regex::new(pattern).map_err(|error| format!("读取规则正则无效：{error}"))?;
+    for name in ["time", "level", "message"] {
+        if !regex
+            .capture_names()
+            .flatten()
+            .any(|capture| capture == name)
+        {
+            return Err(format!("缺少命名捕获组：{name}"));
+        }
+    }
+    if regex.is_match("") {
+        return Err("读取规则不能匹配空行".into());
+    }
+    Ok(regex)
+}
+
+#[derive(Serialize)]
+struct RulePreview {
+    timestamp: String,
+    level: String,
+    message: String,
+}
+
+#[tauri::command]
+fn preview_reading_rule(rule: ReadingRule) -> Result<Vec<RulePreview>, String> {
+    let compiled = compile_rule(&rule)?;
+    let (records, _) = read_records(std::io::Cursor::new(&rule.sample), 0, &compiled)?;
+    Ok(records
+        .into_iter()
+        .map(|record| RulePreview {
+            timestamp: record.timestamp,
+            level: record.level,
+            message: record.message,
+        })
+        .collect())
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RuleSuggestion {
+    path: String,
+    rule_id: Option<String>,
+    matched_headers: usize,
+    note: String,
+}
+
+#[tauri::command]
+async fn suggest_reading_rules(
+    paths: Vec<String>,
+    rules: Vec<ReadingRule>,
+) -> Result<Vec<RuleSuggestion>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let compiled = rules
+            .iter()
+            .map(compile_rule)
+            .collect::<Result<Vec<_>, _>>()?;
+        paths
+            .into_iter()
+            .map(|path| {
+                let file =
+                    File::open(&path).map_err(|error| format!("无法打开 {path}：{error}"))?;
+                let mut reader = BufReader::new(file);
+                let mut bytes = Vec::new();
+                let mut buffer = [0; 8192];
+                // Bound sampling by bytes as well as lines, including a single huge line.
+                while bytes.len() < 64 * 1024 {
+                    use std::io::Read;
+                    let count = reader
+                        .read(&mut buffer)
+                        .map_err(|error| format!("读取 {path}：{error}"))?;
+                    if count == 0 {
+                        break;
+                    }
+                    bytes.extend_from_slice(&buffer[..count]);
+                }
+                let text = match std::str::from_utf8(&bytes) {
+                    Ok(text) => text,
+                    Err(error) if error.error_len().is_none() => {
+                        std::str::from_utf8(&bytes[..error.valid_up_to()])
+                            .map_err(|error| format!("{path} 不是 UTF-8：{error}"))?
+                    }
+                    Err(error) => return Err(format!("{path} 不是 UTF-8：{error}")),
+                };
+                let mut scores = vec![0usize; rules.len()];
+                for line in text.trim_start_matches('\u{feff}').lines().take(200) {
+                    for (index, rule) in compiled.iter().enumerate() {
+                        if let Some(captures) = rule.header.captures(line) {
+                            if let Some(time) = captures.name("time") {
+                                if normalize_rule_time(time.as_str(), &rule.time).is_ok() {
+                                    scores[index] += 1;
+                                }
+                            }
+                        }
+                    }
+                }
+                let best = scores.iter().copied().max().unwrap_or(0);
+                let winners = scores
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, score)| **score == best)
+                    .collect::<Vec<_>>();
+                let rule_id = if best > 0 && winners.len() == 1 {
+                    Some(rules[winners[0].0].id.clone())
+                } else {
+                    None
+                };
+                let note = if best == 0 {
+                    "未匹配到规则，请手动选择或新增规则"
+                } else if winners.len() > 1 {
+                    "多条规则匹配，请手动确认"
+                } else {
+                    "根据文件前 64 KiB / 200 行推荐，可手动切换"
+                };
+                Ok(RuleSuggestion {
+                    path,
+                    rule_id,
+                    matched_headers: best,
+                    note: note.into(),
+                })
+            })
+            .collect()
+    })
+    .await
+    .map_err(|error| format!("规则推荐失败：{error}"))?
+}
+
+#[derive(Deserialize)]
+struct FileReadingRule {
+    path: String,
+    rule: ReadingRule,
+}
 
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -42,6 +292,7 @@ struct LogStore {
     search_regex: Option<Regex>,
     dataset_version: u64,
     filter_revision: u64,
+    search_revision: u64,
 }
 
 #[derive(Default)]
@@ -71,7 +322,7 @@ struct FilterStats {
 async fn pick_log_files() -> Result<Option<Vec<String>>, String> {
     tauri::async_runtime::spawn_blocking(|| {
         rfd::FileDialog::new()
-            .set_title("选择两个 UTF-8 日志文件")
+            .set_title("选择 UTF-8 日志文件（按住 Ctrl 或 Shift 多选）")
             .add_filter("日志文件", &["log", "txt"])
             .pick_files()
             .map(|paths| {
@@ -87,62 +338,55 @@ async fn pick_log_files() -> Result<Option<Vec<String>>, String> {
 
 #[tauri::command]
 async fn load_log_files(
-    paths: Vec<String>,
+    files: Vec<FileReadingRule>,
     state: State<'_, AppState>,
 ) -> Result<LoadStats, String> {
-    if paths.len() != 2 {
-        return Err("请选择且仅选择两个日志文件".to_owned());
+    if files.is_empty() {
+        return Err("请至少选择一个日志文件".to_owned());
     }
+    let rules = files
+        .iter()
+        .map(|file| compile_rule(&file.rule))
+        .collect::<Result<Vec<_>, _>>()?;
 
     let store = Arc::clone(&state.store);
     tauri::async_runtime::spawn_blocking(move || {
         let started = Instant::now();
-        let (left, right) = std::thread::scope(|scope| {
-            let left = scope.spawn(|| read_log_file(&paths[0], 0));
-            let right = scope.spawn(|| read_log_file(&paths[1], 1));
-            (left.join(), right.join())
-        });
-        let (mut left, skipped_left) =
-            left.map_err(|_| "读取第一个文件时发生线程错误".to_owned())??;
-        let (mut right, skipped_right) =
-            right.map_err(|_| "读取第二个文件时发生线程错误".to_owned())??;
-        let sources = vec![file_name(&paths[0]), file_name(&paths[1])];
-        let (records, algorithm) = merge_files(&mut left, &mut right);
+        let (records, algorithm) = if files.len() == 2 {
+            let (left, right) = std::thread::scope(|scope| {
+                let left = scope.spawn(|| read_file_records(&files[0].path, 0, &rules[0]));
+                let right = scope.spawn(|| read_file_records(&files[1].path, 1, &rules[1]));
+                (left.join(), right.join())
+            });
+            let (mut left, _) = left.map_err(|_| "读取第一个文件时发生线程错误".to_owned())??;
+            let (mut right, _) = right.map_err(|_| "读取第二个文件时发生线程错误".to_owned())??;
+            merge_files(&mut left, &mut right)
+        } else {
+            let mut records = Vec::new();
+            for (index, file) in files.iter().enumerate() {
+                let (mut file_records, _) = read_file_records(&file.path, index, &rules[index])?;
+                records.append(&mut file_records);
+            }
+            let algorithm = if records
+                .windows(2)
+                .all(|pair| compare_records(&pair[0], &pair[1]).is_le())
+            {
+                "顺序读取"
+            } else {
+                records.sort_unstable_by(compare_records);
+                "按时间排序"
+            };
+            (records, algorithm)
+        };
+        let sources = files
+            .iter()
+            .map(|file| file_name(&file.path))
+            .collect::<Vec<_>>();
         let total_count = records.len();
         let mut current = store.write().map_err(|_| "日志数据锁已失效".to_owned())?;
         current.dataset_version = current.dataset_version.wrapping_add(1);
         current.filter_revision = 0;
-        current.search_regex = None;
-        let dataset_version = current.dataset_version;
-        current.matches = (0..total_count).collect();
-        current.records = records;
-        current.sources = sources.clone();
-        Ok(LoadStats {
-            total_count,
-            skipped_lines: skipped_left + skipped_right,
-            load_ms: started.elapsed().as_millis(),
-            algorithm: algorithm.to_owned(),
-            sources,
-            dataset_version,
-        })
-    })
-    .await
-    .map_err(|error| format!("日志加载任务失败：{error}"))?
-}
-
-#[tauri::command]
-async fn generate_demo_logs(state: State<'_, AppState>) -> Result<LoadStats, String> {
-    let store = Arc::clone(&state.store);
-    tauri::async_runtime::spawn_blocking(move || {
-        let started = Instant::now();
-        let mut left = generate_demo_file(0, DEMO_RECORDS_PER_FILE);
-        let mut right = generate_demo_file(1, DEMO_RECORDS_PER_FILE);
-        let (records, algorithm) = merge_files(&mut left, &mut right);
-        let total_count = records.len();
-        let sources = vec!["模拟文件 A.log".to_owned(), "模拟文件 B.log".to_owned()];
-        let mut current = store.write().map_err(|_| "日志数据锁已失效".to_owned())?;
-        current.dataset_version = current.dataset_version.wrapping_add(1);
-        current.filter_revision = 0;
+        current.search_revision = 0;
         current.search_regex = None;
         let dataset_version = current.dataset_version;
         current.matches = (0..total_count).collect();
@@ -158,17 +402,14 @@ async fn generate_demo_logs(state: State<'_, AppState>) -> Result<LoadStats, Str
         })
     })
     .await
-    .map_err(|error| format!("演示数据生成任务失败：{error}"))?
+    .map_err(|error| format!("日志加载任务失败：{error}"))?
 }
 
 #[tauri::command]
 async fn filter_logs(
     keyword: String,
-    match_case: bool,
-    whole_word: bool,
-    use_regex: bool,
-    level: String,
-    source_index: i32,
+    levels: Vec<String>,
+    source_indices: Vec<usize>,
     dataset_version: u64,
     revision: u64,
     state: State<'_, AppState>,
@@ -177,14 +418,13 @@ async fn filter_logs(
     tauri::async_runtime::spawn_blocking(move || {
         let started = Instant::now();
         let keyword = keyword.trim();
-        let level = level.to_ascii_uppercase();
-        let search_regex = build_search_regex(keyword, match_case, whole_word, use_regex)?;
+        let filter_regex = build_search_regex(keyword, false, false, false)?;
         let current = store.read().map_err(|_| "日志数据锁已失效".to_owned())?;
         let matches = collect_matches(
             &current.records,
-            search_regex.as_ref(),
-            &level,
-            source_index,
+            filter_regex.as_ref(),
+            &levels,
+            &source_indices,
         );
         let matched_count = matches.len();
         drop(current);
@@ -194,7 +434,6 @@ async fn filter_logs(
         }
         if revision >= current.filter_revision {
             current.matches = matches;
-            current.search_regex = search_regex;
             current.filter_revision = revision;
         }
         Ok(FilterStats {
@@ -204,6 +443,33 @@ async fn filter_logs(
     })
     .await
     .map_err(|error| format!("日志筛选任务失败：{error}"))?
+}
+
+#[tauri::command]
+async fn set_search(
+    keyword: String,
+    match_case: bool,
+    whole_word: bool,
+    use_regex: bool,
+    dataset_version: u64,
+    revision: u64,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let store = Arc::clone(&state.store);
+    tauri::async_runtime::spawn_blocking(move || {
+        let search_regex = build_search_regex(keyword.trim(), match_case, whole_word, use_regex)?;
+        let mut current = store.write().map_err(|_| "日志数据锁已失效".to_owned())?;
+        if current.dataset_version != dataset_version {
+            return Err("日志数据已更新，请重新搜索".to_owned());
+        }
+        if revision >= current.search_revision {
+            current.search_regex = search_regex;
+            current.search_revision = revision;
+        }
+        Ok(())
+    })
+    .await
+    .map_err(|error| format!("日志搜索任务失败：{error}"))?
 }
 
 #[tauri::command]
@@ -246,31 +512,99 @@ fn get_logs_page(
         .collect())
 }
 
-fn read_log_file(path: &str, file_index: usize) -> Result<(Vec<LogRecord>, usize), String> {
+fn read_file_records(
+    path: &str,
+    file_index: usize,
+    rule: &CompiledRule,
+) -> Result<(Vec<LogRecord>, usize), String> {
     let file = File::open(path).map_err(|error| format!("无法打开 {path}：{error}"))?;
-    let name = Path::new(path)
-        .file_name()
-        .map(|name| name.to_string_lossy().into_owned())
-        .unwrap_or_else(|| path.to_owned());
-    let reader = BufReader::new(file);
-    let mut records = Vec::new();
-    let mut skipped_lines = 0;
+    read_records(BufReader::new(file), file_index, rule).map_err(|error| format!("{path}：{error}"))
+}
 
-    for (line_number, line) in reader.lines().enumerate() {
-        let line =
-            line.map_err(|error| format!("读取 {name} 第 {} 行失败：{error}", line_number + 1))?;
-        let line = line.trim_start_matches('\u{feff}');
-        if line.trim().is_empty() {
-            continue;
-        }
-        if let Some(record) = parse_log_line(line, file_index, line_number as u64) {
-            records.push(record);
-        } else {
-            skipped_lines += 1;
+fn normalize_rule_time(time: &str, format: &Regex) -> Result<String, String> {
+    let fields = format
+        .captures(time)
+        .ok_or_else(|| format!("时间与规则格式不匹配：{time}"))?;
+    if let Some(offset) = fields.name("z") {
+        let bytes = offset.as_str().as_bytes();
+        if parse_digits(&bytes[1..3]).is_none_or(|hour| hour > 23)
+            || parse_digits(&bytes[3..5]).is_none_or(|minute| minute > 59)
+        {
+            return Err(format!("时区偏移无效：{time}"));
         }
     }
+    let fraction = fields.name("f").map(|value| value.as_str()).unwrap_or("0");
+    let normalized = format!(
+        "{}-{}-{} {}:{}:{}.{}",
+        &fields["Y"],
+        &fields["m"],
+        &fields["d"],
+        &fields["H"],
+        &fields["M"],
+        &fields["S"],
+        fraction
+    );
+    if parse_log_line(&normalized, 0, 0).is_none() {
+        return Err(format!("时间无效：{time}"));
+    }
+    Ok(normalized)
+}
 
-    Ok((records, skipped_lines))
+fn read_records(
+    reader: impl BufRead,
+    file_index: usize,
+    rule: &CompiledRule,
+) -> Result<(Vec<LogRecord>, usize), String> {
+    let mut records: Vec<LogRecord> = Vec::new();
+    let mut prefix = String::new();
+    for (line_number, line) in reader.lines().enumerate() {
+        let line = line.map_err(|error| format!("读取第 {} 行失败：{error}", line_number + 1))?;
+        let line = if line_number == 0 {
+            line.trim_start_matches('\u{feff}')
+        } else {
+            &line
+        };
+        if let Some(captures) = rule.header.captures(line) {
+            let time = captures
+                .name("time")
+                .ok_or_else(|| format!("第 {} 行缺少时间", line_number + 1))?
+                .as_str();
+            let normalized_time = normalize_rule_time(time, &rule.time)
+                .map_err(|error| format!("第 {} 行：{error}", line_number + 1))?;
+            let mut record = parse_log_line(&normalized_time, file_index, line_number as u64)
+                .ok_or_else(|| format!("第 {} 行时间无效：{time}", line_number + 1))?;
+            if let Some(level) = captures.name("level") {
+                let normalized = level.as_str().to_ascii_uppercase();
+                if !matches!(
+                    normalized.as_str(),
+                    "TRACE" | "DEBUG" | "INFO" | "WARN" | "WARNING" | "ERROR" | "FATAL"
+                ) {
+                    return Err(format!("第 {} 行级别无效：{normalized}", line_number + 1));
+                }
+                record.level = parse_level(&normalized).0.to_owned();
+            }
+            record.message = captures
+                .name("message")
+                .ok_or_else(|| format!("第 {} 行缺少内容捕获组", line_number + 1))?
+                .as_str()
+                .to_owned();
+            if !prefix.is_empty() {
+                prefix.push_str(&record.message);
+                record.message = std::mem::take(&mut prefix);
+            }
+            records.push(record);
+        } else if let Some(record) = records.last_mut() {
+            record.message.push('\n');
+            record.message.push_str(line);
+        } else {
+            prefix.push_str(line);
+            prefix.push('\n');
+        }
+    }
+    if records.is_empty() {
+        return Err("没有匹配到日志记录，请调整读取规则".into());
+    }
+    Ok((records, 0))
 }
 
 fn parse_log_line(line: &str, file_index: usize, sequence: u64) -> Option<LogRecord> {
@@ -291,6 +625,22 @@ fn parse_log_line(line: &str, file_index: usize, sequence: u64) -> Option<LogRec
     let hour = parse_digits(&bytes[11..13])?;
     let minute = parse_digits(&bytes[14..16])?;
     let second = parse_digits(&bytes[17..19])?;
+    let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+    let days = match month {
+        2 => {
+            if leap {
+                29
+            } else {
+                28
+            }
+        }
+        4 | 6 | 9 | 11 => 30,
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        _ => return None,
+    };
+    if year == 0 || day == 0 || day > days || hour > 23 || minute > 59 || second > 59 {
+        return None;
+    }
     let mut cursor = 19;
     let mut millis = 0;
     if bytes.get(cursor) == Some(&b'.') {
@@ -420,38 +770,6 @@ fn merge_files(
     (merged, strategy)
 }
 
-fn generate_demo_file(file_index: usize, count: usize) -> Vec<LogRecord> {
-    (0..count)
-        .map(|index| {
-            let elapsed_ms = index as u64 * 2 + file_index as u64;
-            let total_seconds = elapsed_ms / 1_000;
-            let minute = (total_seconds / 60) as u32;
-            let second = (total_seconds % 60) as u32;
-            let millis = (elapsed_ms % 1_000) as u32;
-            let (level, message) = if index % 100 == 0 {
-                (
-                    "ERROR",
-                    format!("请求失败，trace_id={file_index:02}-{index:06}"),
-                )
-            } else if index % 20 == 0 {
-                ("WARN", format!("响应延迟偏高，request_id={index:06}"))
-            } else if index % 10 == 0 {
-                ("DEBUG", format!("连接状态检查通过，worker={}", index % 32))
-            } else {
-                ("INFO", format!("批处理任务完成，记录编号={index:06}"))
-            };
-            LogRecord {
-                sort_key: pack_time(2026, 11, 5, 10, minute, second, millis),
-                file_index,
-                sequence: index as u64,
-                timestamp: format!("2026-11-05 10:{minute:02}:{second:02}.{millis:03}"),
-                level: level.to_owned(),
-                message,
-            }
-        })
-        .collect()
-}
-
 fn file_name(path: &str) -> String {
     Path::new(path)
         .file_name()
@@ -503,15 +821,15 @@ fn build_search_regex(
 fn collect_matches(
     records: &[LogRecord],
     search_regex: Option<&Regex>,
-    level: &str,
-    source_index: i32,
+    levels: &[String],
+    source_indices: &[usize],
 ) -> Vec<usize> {
     records
         .iter()
         .enumerate()
         .filter_map(|(index, record)| {
-            let level_matches = level == "ALL" || record.level == level;
-            let source_matches = source_index < 0 || record.file_index == source_index as usize;
+            let level_matches = levels.contains(&record.level);
+            let source_matches = source_indices.contains(&record.file_index);
             let keyword_matches = search_regex.is_none_or(|regex| {
                 regex.is_match(&record.message) || regex.is_match(&record.timestamp)
             });
@@ -526,9 +844,13 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             pick_log_files,
             load_log_files,
-            generate_demo_logs,
             filter_logs,
-            get_logs_page
+            set_search,
+            get_logs_page,
+            default_reading_rules,
+            validate_reading_rules,
+            preview_reading_rule,
+            suggest_reading_rules
         ])
         .run(tauri::generate_context!())
         .expect("启动 Tauri 应用失败");
@@ -537,6 +859,342 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reads_jabra_direct_levels_objects_arrays_and_stacks() {
+        let preset = default_reading_rules().remove(2);
+        let rule = compile_rule(&preset).unwrap();
+        let text = "[2026-11-06 11:34:55.197] [info] [\n  'Service',\n  { status: 'started' }\n]\n[2026-11-06 11:34:57.611] [debug] (success) {\n  status: 'started'\n}\n[2026-11-06 11:35:01.664] [error] TypeError: A number was expected\n    at example.js:1:1";
+        let (records, _) = read_records(std::io::Cursor::new(text), 0, &rule).unwrap();
+        assert_eq!(records.len(), 3);
+        assert_eq!(
+            records
+                .iter()
+                .map(|record| record.level.as_str())
+                .collect::<Vec<_>>(),
+            ["INFO", "DEBUG", "ERROR"]
+        );
+        assert!(records[0].message.ends_with("\n]"));
+        assert!(records[1].message.ends_with("\n}"));
+        assert!(records[2].message.ends_with("\n    at example.js:1:1"));
+        assert_eq!(
+            records
+                .iter()
+                .map(|record| record.message.matches('\n').count() + 1)
+                .sum::<usize>(),
+            text.lines().count()
+        );
+        for other in &default_reading_rules()[..2] {
+            assert!(
+                read_records(std::io::Cursor::new(text), 0, &compile_rule(other).unwrap()).is_err()
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "requires an explicitly supplied Jabra Direct log directory"]
+    fn reads_supplied_jabra_direct_files() {
+        let directory =
+            std::env::var("LOGSTRYX_TEST_DIRECT_DIR").expect("set LOGSTRYX_TEST_DIRECT_DIR");
+        let preset = default_reading_rules().remove(2);
+        let rule = compile_rule(&preset).unwrap();
+        let mut paths = Vec::new();
+        let mut combined = Vec::new();
+        let header = Regex::new(r"^\[\d{4}-\d{2}-\d{2} ").unwrap();
+        for (index, name) in [
+            "JabraDirect.Analytics.main.log",
+            "JabraDirect.main.log",
+            "JabraDirect.renderer.log",
+            "JabraDirect.telemetry.log",
+        ]
+        .iter()
+        .enumerate()
+        {
+            let path = Path::new(&directory).join(name);
+            let text = std::fs::read_to_string(&path).unwrap();
+            let (mut records, skipped) =
+                read_records(std::io::Cursor::new(&text), index, &rule).unwrap();
+            assert_eq!(skipped, 0);
+            assert_eq!(
+                records.len(),
+                text.trim_start_matches('\u{feff}')
+                    .lines()
+                    .filter(|line| header.is_match(line))
+                    .count()
+            );
+            assert_eq!(
+                records
+                    .iter()
+                    .map(|record| record.message.matches('\n').count() + 1)
+                    .sum::<usize>(),
+                text.lines().count()
+            );
+            assert!(records
+                .iter()
+                .all(|record| ["INFO", "WARN", "ERROR", "DEBUG", "TRACE"]
+                    .contains(&record.level.as_str())));
+            combined.append(&mut records);
+            paths.push(path.to_string_lossy().into_owned());
+        }
+        let suggestions =
+            tauri::async_runtime::block_on(suggest_reading_rules(paths, default_reading_rules()))
+                .unwrap();
+        assert!(suggestions
+            .iter()
+            .all(|suggestion| suggestion.rule_id.as_deref() == Some("jabra-direct")));
+        combined.sort_unstable_by(compare_records);
+        assert!(combined
+            .windows(2)
+            .all(|pair| compare_records(&pair[0], &pair[1]).is_le()));
+        for index in 0..4 {
+            assert!(combined.iter().any(|record| record.file_index == index));
+        }
+    }
+
+    #[test]
+    fn validates_independent_rules_and_custom_timestamp_templates() {
+        let defaults = default_reading_rules();
+        validate_reading_rules(defaults.clone()).unwrap();
+        assert!(validate_reading_rules(vec![]).is_err());
+        assert!(validate_reading_rules(vec![defaults[0].clone(), defaults[0].clone()]).is_err());
+        let mut custom = defaults[0].clone();
+        custom.time_format = "%d/%m/%Y %H:%M:%S,%f".into();
+        custom.pattern = r"^(?P<time>[^|]+)\|(?P<level>INFO)\|(?P<message>.*)$".into();
+        custom.sample = "06/11/2026 13:06:40,123456|INFO|custom time".into();
+        let records = preview_reading_rule(custom.clone()).unwrap();
+        assert_eq!(records[0].timestamp, "2026-11-06 13:06:40.123");
+        validate_reading_rules(vec![custom.clone()]).unwrap();
+        custom.time_format = "%Y-%m-%d".into();
+        assert!(compile_rule(&custom).is_err());
+        custom.time_format = "%d/%m/%Y %H:%M:%S,%f %Q".into();
+        assert!(compile_rule(&custom).is_err());
+        assert!(preview_reading_rule(ReadingRule {
+            sample: defaults[1].sample.clone(),
+            ..defaults[0].clone()
+        })
+        .is_err());
+        assert!(preview_reading_rule(ReadingRule {
+            sample: defaults[0].sample.clone(),
+            ..defaults[1].clone()
+        })
+        .is_err());
+    }
+
+    #[test]
+    fn reading_rule_groups_multiline_records_and_preserves_context() {
+        let rule = compile_rule(&default_reading_rules()[0]).unwrap();
+        let text = "\u{feff}2026-11-06 11:34:56.891 INFO  [39920] [javascript:CameraApi::reConfigure@0] Configuring API with {\n   \"discoverIntervalMs\": 4000\n}\n2026-11-06 11:34:56.891 INFO  [39920] initialized\nlast line";
+        let (records, skipped) = read_records(std::io::Cursor::new(text), 0, &rule).unwrap();
+        assert_eq!(records.len(), 2);
+        assert_eq!(skipped, 0);
+        assert_eq!(records[0].level, "INFO");
+        assert_eq!(records[0].timestamp, records[1].timestamp);
+        assert!(records[0].message.starts_with("[39920] [javascript:"));
+        assert!(records[0]
+            .message
+            .ends_with("{\n   \"discoverIntervalMs\": 4000\n}"));
+        assert!(records[1].message.ends_with("\nlast line"));
+        assert!(compare_records(&records[0], &records[1]).is_lt());
+    }
+
+    #[test]
+    fn reading_rules_validate_patterns_and_dates_without_dropping_prefixes() {
+        for pattern in ["(", "^.*$", "^(?P<time>.*)(?P<level>.*)(?P<message>.*)$"] {
+            assert!(compile_reading_rule(pattern).is_err());
+        }
+        let rule = compile_rule(&default_reading_rules()[0]).unwrap();
+        for text in [
+            "2026-02-30 11:34:56.891 INFO test",
+            "",
+            "only untimed content",
+        ] {
+            assert!(read_records(std::io::Cursor::new(text), 0, &rule).is_err());
+        }
+        let (records, _) = read_records(
+            std::io::Cursor::new(
+                "2026-11-05T11:13:18.35Z [WARNING] slow request\n2026-11-05 11:13:19 no level",
+            ),
+            0,
+            &rule,
+        )
+        .unwrap();
+        assert_eq!(records[0].level, "WARN");
+        assert_eq!(records[0].message, "slow request");
+        assert_eq!(records[1].level, "INFO");
+        assert_eq!(records[1].message, "no level");
+        let custom = r"^(?P<level>INFO)\|(?P<time>[^|]+)\|(?P<message>.*)$";
+        let preview = preview_reading_rule(ReadingRule {
+            pattern: custom.into(),
+            sample: "INFO|2026-11-06 13:06:40.045|hello\nworld".into(),
+            ..default_reading_rules().remove(0)
+        })
+        .unwrap();
+        assert_eq!(preview[0].message, "hello\nworld");
+    }
+
+    #[test]
+    fn reads_sdk_headers_and_attaches_untimed_lines() {
+        let rule = compile_rule(&default_reading_rules()[1]).unwrap();
+        let text = "Initializing logger LIBJABRA_TRACE_LEVEL: INFO\n[11:45:06:469+0800 2026-11-06    INFO](t30380): Build time\n[11:45:06:470+0800 2026-11-06    INFO](t30380): SDK version\nInitializing logger LIBJABRA_TRACE_LEVEL: INFO\n[11:47:50:053+0800 2026-11-06    INFO](t48752): Build time";
+        let (records, _) = read_records(std::io::Cursor::new(text), 1, &rule).unwrap();
+        assert_eq!(records.len(), 3);
+        assert_eq!(records[0].timestamp, "2026-11-06 11:45:06.469");
+        assert_eq!(records[0].level, "INFO");
+        assert_eq!(
+            records[0].message,
+            "Initializing logger LIBJABRA_TRACE_LEVEL: INFO\n(t30380): Build time"
+        );
+        assert_eq!(
+            records[1].message,
+            "(t30380): SDK version\nInitializing logger LIBJABRA_TRACE_LEVEL: INFO"
+        );
+        assert_eq!(records[2].timestamp, "2026-11-06 11:47:50.053");
+        assert!(records.iter().all(|record| record.file_index == 1));
+        for time in ["25:45:06:469+0800", "11:45:06:469+2460"] {
+            let text = format!("[{time} 2026-11-06 INFO](t1): invalid");
+            assert!(read_records(std::io::Cursor::new(text), 0, &rule).is_err());
+        }
+    }
+
+    #[test]
+    fn merges_different_formats_with_multiline_content_and_tied_timestamps() {
+        let date_rule = compile_rule(&default_reading_rules()[0]).unwrap();
+        let sdk_rule = compile_rule(&default_reading_rules()[1]).unwrap();
+        let (mut first, _) = read_records(std::io::Cursor::new("2026-11-06 11:45:06.469 INFO config {\n  \"x\": 1\n}\n2026-11-06 11:45:06.471 WARN later"), 0, &date_rule).unwrap();
+        let (mut second, _) = read_records(std::io::Cursor::new("Initializing logger\n[11:45:06:469+0800 2026-11-06 INFO](t1): first\n[11:45:06:470+0800 2026-11-06 ERROR](t1): second"), 1, &sdk_rule).unwrap();
+        let (records, _) = merge_files(&mut first, &mut second);
+        assert_eq!(records.len(), 4);
+        assert_eq!(
+            records
+                .iter()
+                .map(|record| record.file_index)
+                .collect::<Vec<_>>(),
+            [0, 1, 1, 0]
+        );
+        assert!(records[0].message.ends_with("\n}"));
+        assert!(records[1].message.starts_with("Initializing logger\n"));
+        assert_eq!(records[2].level, "ERROR");
+    }
+
+    #[test]
+    #[ignore = "requires two explicitly supplied local log fixtures"]
+    fn reads_supplied_two_log_formats() {
+        let first = std::env::var("LOGSTRYX_TEST_LOG").expect("set LOGSTRYX_TEST_LOG");
+        let second =
+            std::env::var("LOGSTRYX_TEST_SECOND_LOG").expect("set LOGSTRYX_TEST_SECOND_LOG");
+        let suggestions = tauri::async_runtime::block_on(suggest_reading_rules(
+            vec![first.clone(), second.clone()],
+            default_reading_rules(),
+        ))
+        .unwrap();
+        assert_eq!(suggestions[0].rule_id.as_deref(), Some("date-first"));
+        assert!(suggestions[0].matched_headers >= 9);
+        assert_eq!(suggestions[1].rule_id.as_deref(), Some("jabra-sdk"));
+        assert!(suggestions[1].matched_headers >= 20);
+        let no_match = tauri::async_runtime::block_on(suggest_reading_rules(
+            vec![first.clone()],
+            vec![default_reading_rules()[1].clone()],
+        ))
+        .unwrap();
+        assert!(no_match[0].rule_id.is_none());
+        let ambiguous = tauri::async_runtime::block_on(suggest_reading_rules(
+            vec![first.clone()],
+            vec![
+                default_reading_rules()[0].clone(),
+                ReadingRule {
+                    id: "another".into(),
+                    ..default_reading_rules()[0].clone()
+                },
+            ],
+        ))
+        .unwrap();
+        assert!(ambiguous[0].rule_id.is_none());
+        let date_rule = compile_rule(&default_reading_rules()[0]).unwrap();
+        let sdk_rule = compile_rule(&default_reading_rules()[1]).unwrap();
+        let first_text = std::fs::read_to_string(&first).unwrap();
+        let second_text = std::fs::read_to_string(&second).unwrap();
+        let first_count = first_text
+            .lines()
+            .filter(|line| line.trim_start_matches('\u{feff}').starts_with("2026-"))
+            .count();
+        let second_count = second_text
+            .lines()
+            .filter(|line| line.starts_with('['))
+            .count();
+        let (left, right) = std::thread::scope(|scope| {
+            let left =
+                scope.spawn(|| read_records(std::io::Cursor::new(&first_text), 0, &date_rule));
+            let right =
+                scope.spawn(|| read_records(std::io::Cursor::new(&second_text), 1, &sdk_rule));
+            (
+                left.join().unwrap().unwrap(),
+                right.join().unwrap().unwrap(),
+            )
+        });
+        let (mut left, _) = left;
+        let (mut right, _) = right;
+        assert_eq!(left.len(), first_count);
+        assert_eq!(right.len(), second_count);
+        assert_eq!(
+            right
+                .iter()
+                .map(|record| record.message.matches("Initializing logger").count())
+                .sum::<usize>(),
+            second_text.matches("Initializing logger").count()
+        );
+        let (records, _) = merge_files(&mut left, &mut right);
+        assert_eq!(records.len(), first_count + second_count);
+        assert!(records
+            .windows(2)
+            .all(|pair| compare_records(&pair[0], &pair[1]).is_le()));
+        assert_eq!(
+            records
+                .iter()
+                .filter(|record| record.file_index == 0)
+                .count(),
+            first_count
+        );
+        assert_eq!(
+            records
+                .iter()
+                .map(|record| record.message.matches('\n').count() + 1)
+                .sum::<usize>(),
+            first_text.lines().count() + second_text.lines().count()
+        );
+    }
+
+    #[test]
+    #[ignore = "requires an explicitly supplied local log fixture"]
+    fn reads_supplied_panacast_log() {
+        let path = std::env::var("LOGSTRYX_TEST_LOG").expect("set LOGSTRYX_TEST_LOG");
+        let rule = compile_rule(&default_reading_rules()[0]).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        let (records, skipped) = read_records(std::io::Cursor::new(&text), 0, &rule).unwrap();
+        assert_eq!(
+            records.len(),
+            text.lines()
+                .filter(|line| line.trim_start_matches('\u{feff}').starts_with("2026-"))
+                .count()
+        );
+        assert_eq!(skipped, 0);
+        assert_eq!(
+            records
+                .iter()
+                .filter(|record| record.message.contains('\n'))
+                .count(),
+            text.matches("Configuring API with {").count()
+        );
+        assert_eq!(
+            records
+                .iter()
+                .map(|record| record.message.matches('\n').count() + 1)
+                .sum::<usize>(),
+            text.lines().count()
+        );
+        assert!(records.iter().all(|record| record.level == "INFO"));
+        assert_eq!(records[0].timestamp, "2026-11-06 11:34:56.891");
+        assert_eq!(records[8].timestamp, "2026-11-06 13:06:40.045");
+    }
 
     #[test]
     fn merges_two_sorted_files_in_timestamp_order() {
@@ -591,12 +1249,34 @@ mod tests {
             parse_log_line("2026-11-05 10:00:00.002 [INFO] request complete", 0, 1).unwrap(),
         ];
         let search = build_search_regex("FAILED", false, false, false).unwrap();
-        assert_eq!(collect_matches(&records, search.as_ref(), "ERROR", 0), [0]);
+        assert_eq!(
+            collect_matches(&records, search.as_ref(), &["ERROR".into()], &[0]),
+            [0]
+        );
         let search = build_search_regex("request", false, false, false).unwrap();
         assert_eq!(
-            collect_matches(&records, search.as_ref(), "ALL", -1),
+            collect_matches(
+                &records,
+                search.as_ref(),
+                &["ERROR".into(), "INFO".into()],
+                &[0, 1]
+            ),
             [0, 1, 2]
         );
+    }
+
+    #[test]
+    fn supports_multiple_levels_and_sources_and_empty_selection() {
+        let records = vec![
+            parse_log_line("2026-11-05 10:00:00.000 [ERROR] failed", 0, 0).unwrap(),
+            parse_log_line("2026-11-05 10:00:00.001 [WARN] slow", 1, 0).unwrap(),
+            parse_log_line("2026-11-05 10:00:00.002 [INFO] complete", 0, 1).unwrap(),
+        ];
+        let levels = vec!["ERROR".into(), "WARN".into()];
+        assert_eq!(collect_matches(&records, None, &levels, &[0, 1]), [0, 1]);
+        assert_eq!(collect_matches(&records, None, &levels, &[1]), [1]);
+        assert!(collect_matches(&records, None, &[], &[0, 1]).is_empty());
+        assert!(collect_matches(&records, None, &levels, &[]).is_empty());
     }
 
     #[test]
@@ -608,17 +1288,20 @@ mod tests {
         ];
 
         let search = build_search_regex("Request", true, false, false).unwrap();
-        assert_eq!(collect_matches(&records, search.as_ref(), "ALL", -1), [0]);
+        assert_eq!(
+            collect_matches(&records, search.as_ref(), &["INFO".into()], &[0]),
+            [0]
+        );
 
         let search = build_search_regex("request", false, true, false).unwrap();
         assert_eq!(
-            collect_matches(&records, search.as_ref(), "ALL", -1),
+            collect_matches(&records, search.as_ref(), &["INFO".into()], &[0]),
             [0, 1]
         );
 
         let search = build_search_regex(r"request\s+failed$", false, false, true).unwrap();
         assert_eq!(
-            collect_matches(&records, search.as_ref(), "ALL", -1),
+            collect_matches(&records, search.as_ref(), &["INFO".into()], &[0]),
             [0, 1]
         );
 

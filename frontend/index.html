@@ -4,78 +4,155 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <meta name="description" content="A cross-platform log analysis workbench for fast search, powerful filtering, and AI-assisted troubleshooting." />
+    <link rel="icon" type="image/png" href="./favicon.png" />
     <title>LogStryx · 智能日志检索</title>
     <link rel="stylesheet" href="./style.css" />
     <script src="./main.js" defer></script>
   </head>
   <body>
-    <main class="app">
-      <header class="page-header">
-        <div>
-          <p class="eyebrow">LOGSTRYX · CROSS-PLATFORM LOG WORKBENCH</p>
-          <h1>LogStryx</h1>
-          <p class="subtitle">跨平台智能日志检索与分析</p>
-        </div>
-        <div class="header-actions">
-          <button id="loadFiles" class="button secondary" type="button">选择两个日志文件</button>
-          <button id="loadDemo" class="button primary" type="button">载入 100 万条演示</button>
-        </div>
-      </header>
-
-      <section class="metrics" aria-label="性能统计">
-        <div class="metric"><span>合并记录</span><strong id="totalCount">—</strong></div>
-        <div class="metric"><span>筛选结果</span><strong id="matchedCount">—</strong></div>
-        <div class="metric"><span>读取与合并</span><strong id="loadTime">—</strong></div>
-        <div class="metric"><span>当前筛选</span><strong id="filterTime">—</strong></div>
-        <div class="metric"><span>页面行数</span><strong id="renderedCount">0</strong></div>
-      </section>
-
-      <section class="log-panel" aria-label="合并后的日志">
-        <div class="filters">
-          <div class="search-field">
-            <label class="sr-only" for="keyword">关键字筛选并高亮</label>
-            <div class="search-box">
-              <input id="keyword" type="search" placeholder="搜索日志并高亮" autocomplete="off" />
-              <div class="search-options" role="group" aria-label="搜索选项">
-                <button class="search-option" type="button" data-option="matchCase" aria-label="区分大小写" title="区分大小写 (Aa)" aria-pressed="false">Aa</button>
-                <button class="search-option" type="button" data-option="wholeWord" aria-label="全词匹配" title="全词匹配 (ab)" aria-pressed="false">ab</button>
-                <button class="search-option" type="button" data-option="useRegex" aria-label="使用正则表达式" title="使用正则表达式 (.*)" aria-pressed="false">.*</button>
-              </div>
-            </div>
+    <header class="titlebar">
+      <img class="titlebar-icon" src="./favicon.png" alt="" draggable="false" data-tauri-drag-region />
+      <span class="titlebar-title" data-tauri-drag-region="deep">LogStryx · 智能日志检索</span>
+      <nav class="titlebar-menus" aria-label="应用菜单">
+        <div class="titlebar-menu">
+          <button class="titlebar-menu-trigger" type="button" aria-expanded="false">文件</button>
+          <div class="titlebar-menu-popover" hidden>
+            <button type="button" data-menu-action="open_logs"><span>打开日志文件…</span><kbd>Ctrl+O</kbd></button>
+            <span class="titlebar-menu-separator" role="separator"></span>
+            <button type="button" data-menu-action="quit"><span>退出</span></button>
           </div>
-          <label class="select-field">
-            <span class="sr-only">按级别筛选</span>
-            <select id="levelFilter">
-              <option value="ALL">全部级别</option>
-              <option value="INFO">信息</option>
-              <option value="WARN">警告</option>
-              <option value="ERROR">错误</option>
-              <option value="DEBUG">调试</option>
-              <option value="TRACE">跟踪</option>
-            </select>
-          </label>
-          <label class="select-field source-select">
-            <span class="sr-only">按文件筛选</span>
-            <select id="sourceFilter">
-              <option value="-1">两个文件</option>
-            </select>
-          </label>
-          <span id="fileSummary" class="file-summary">等待载入两个文件</span>
+        </div>
+        <div class="titlebar-menu">
+          <button class="titlebar-menu-trigger" type="button" aria-expanded="false">编辑</button>
+          <div class="titlebar-menu-popover" hidden>
+            <button type="button" data-menu-action="focus_search"><span>搜索日志</span><kbd>Ctrl+F</kbd></button>
+            <button type="button" data-menu-action="clear_filters"><span>清空筛选</span><kbd>Ctrl+K</kbd></button>
+            <button type="button" data-menu-action="reading_rules"><span>日志读取规则…</span></button>
+          </div>
+        </div>
+        <div class="titlebar-menu">
+          <button class="titlebar-menu-trigger" type="button" aria-expanded="false">帮助</button>
+          <div class="titlebar-menu-popover" hidden>
+            <button type="button" data-menu-action="about"><span>关于 LogStryx</span></button>
+          </div>
+        </div>
+      </nav>
+      <div class="titlebar-drag" aria-hidden="true" data-tauri-drag-region></div>
+      <div class="window-controls" aria-label="窗口控制">
+        <button class="window-control minimize" type="button" aria-label="最小化">
+          <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M3 8h10" /></svg>
+        </button>
+        <button class="window-control maximize" type="button" aria-label="最大化">
+          <svg viewBox="0 0 16 16" aria-hidden="true"><rect x="3.5" y="3.5" width="9" height="9" /></svg>
+        </button>
+        <button class="window-control close" type="button" aria-label="关闭">
+          <svg viewBox="0 0 16 16" aria-hidden="true"><path d="m4 4 8 8M12 4l-8 8" /></svg>
+        </button>
+      </div>
+    </header>
+    <dialog id="readingRules" class="reading-rules" aria-labelledby="readingRulesTitle">
+      <form id="readingRulesForm">
+        <h2 id="readingRulesTitle">日志读取规则</h2>
+        <p>每种格式单独设置规则，导入时为每个文件选择。无时间行接到上一条；文件开头的无时间行接到下一条。修改规则不会改变当前列表。</p>
+        <div class="rule-workspace">
+        <aside class="rule-sidebar">
+          <label for="readingRuleList">规则列表</label>
+          <select id="readingRuleList" size="7" aria-label="规则列表"></select>
+          <div class="reading-rule-actions">
+            <button id="addReadingRule" type="button">新增</button>
+            <button id="deleteReadingRule" type="button">删除</button>
+          </div>
+        </aside>
+        <div class="rule-editor">
+        <label for="readingRuleName">规则名称</label>
+        <input id="readingRuleName" required maxlength="80" />
+        <label for="readingPattern">日志头正则</label>
+        <textarea id="readingPattern" rows="4" spellcheck="false" required aria-describedby="readingPatternHelp"></textarea>
+        <p id="readingPatternHelp">Rust regex 语法，以 ^ 开头、$ 结尾，包含 time、level、message 命名组，例如 (?P&lt;time&gt;...)。不支持前后查找和反向引用。</p>
+        <label for="readingTimeFormat">时间格式</label>
+        <input id="readingTimeFormat" required spellcheck="false" aria-describedby="readingTimeHelp" />
+        <p id="readingTimeHelp">%Y 年、%m 月、%d 日、%H 时、%M 分、%S 秒、%f 小数秒（1–9 位）、%z 偏移（如 +0800）、%% 百分号。%[ T] 表示空格或 T，%[.f] 表示可选小数秒，%[Z] 表示可选 Z。其他字符按原样匹配，空格匹配空白。按本地时间排序，不转换时区，请确保各文件采用相同时区。</p>
+        <label for="readingSample">示例日志（可粘贴多行 JSON 或堆栈）</label>
+        <textarea id="readingSample" rows="6" spellcheck="false"></textarea>
+        <div id="readingRuleFeedback" role="status" aria-live="polite"></div>
+        <div id="readingRulePreview" class="reading-rule-preview"></div>
+        </div>
+        </div>
+        <div class="reading-rule-actions">
+          <button id="resetReadingRule" type="button">重置当前规则</button>
+          <button id="previewReadingRule" type="button">预览解析</button>
+          <span></span>
+          <button id="cancelReadingRule" type="button">取消</button>
+          <button id="saveReadingRule" class="primary" type="submit">保存规则</button>
+        </div>
+      </form>
+    </dialog>
+    <dialog id="fileRules" class="reading-rules" aria-labelledby="fileRulesTitle">
+      <form id="fileRulesForm">
+        <h2 id="fileRulesTitle">选择文件读取规则</h2>
+        <p>每个文件独立选择规则，确认后读取并按时间合并。推荐结果仅基于文件开头的样本。</p>
+        <div id="fileRuleAssignments"></div>
+        <p id="fileRuleFeedback" role="status" aria-live="polite"></p>
+        <div class="reading-rule-actions">
+          <button id="manageFileRules" type="button">管理规则…</button>
+          <span></span>
+          <button id="cancelFileRules" type="button">取消</button>
+          <button id="confirmFileRules" class="primary" type="submit">读取并合并</button>
+        </div>
+      </form>
+    </dialog>
+    <main class="app">
+      <section class="log-panel" aria-label="合并后的日志">
+        <div class="list-header">
+          <span data-column="timestamp" draggable="true">时间</span>
+          <div class="column-filter" data-column="level" draggable="true">
+            <button id="levelFilter" class="column-filter-trigger" type="button" aria-expanded="false" aria-controls="levelOptions">级别</button>
+            <div id="levelOptions" class="column-filter-popover" role="group" aria-label="按级别筛选" hidden></div>
+          </div>
+          <div class="column-filter" data-column="source" draggable="true">
+            <button id="sourceFilter" class="column-filter-trigger" type="button" aria-expanded="false" aria-controls="sourceOptions">文件</button>
+            <div id="sourceOptions" class="column-filter-popover" role="group" aria-label="按文件筛选" hidden></div>
+          </div>
+          <span data-column="message" draggable="true">日志内容</span>
+          <div class="column-settings">
+            <button id="columnSettings" type="button" aria-label="Configure columns" title="Columns" aria-expanded="false" aria-controls="columnSettingsOptions">
+              <svg viewBox="0 0 16 16" aria-hidden="true"><rect x="2" y="3" width="12" height="10" rx="1" /><path d="M6 3v10M10 3v10" /></svg>
+            </button>
+            <div id="columnSettingsOptions" class="column-filter-popover" role="group" aria-label="Visible columns" hidden></div>
+          </div>
+        </div>
+        <div class="list-body">
+        <div class="search-field" hidden>
+          <button class="search-expand" type="button" aria-label="Collapse filter input" aria-expanded="true">
+            <svg viewBox="0 0 16 16" aria-hidden="true"><path d="m4 6 4 4 4-4" /></svg>
+          </button>
+          <div class="search-input-row">
+            <label class="sr-only" for="keyword">Search logs and highlight matches</label>
+            <input id="keyword" type="search" placeholder="Search" autocomplete="off" />
+            <div class="search-options" role="group" aria-label="Search options">
+              <button class="search-option" type="button" data-option="matchCase" aria-label="Match case" title="Match case (Aa)" aria-pressed="false">Aa</button>
+              <button class="search-option" type="button" data-option="wholeWord" aria-label="Match whole word" title="Match whole word (ab)" aria-pressed="false">ab</button>
+              <button class="search-option" type="button" data-option="useRegex" aria-label="Use regular expression" title="Use regular expression (.*)" aria-pressed="false">.*</button>
+            </div>
+            <button class="search-close" type="button" aria-label="Close search">
+              <svg viewBox="0 0 16 16" aria-hidden="true"><path d="m4 4 8 8M12 4l-8 8" /></svg>
+            </button>
+          </div>
+          <label class="sr-only" for="filterKeyword">Filter logs</label>
+          <input id="filterKeyword" class="filter-input" type="search" placeholder="Filter" autocomplete="off" />
         </div>
 
-        <div class="list-header" aria-hidden="true">
-          <span>时间</span><span>级别</span><span>文件</span><span>日志内容</span>
-        </div>
         <div id="listViewport" class="list-viewport" role="list" aria-label="日志记录">
           <div id="virtualSpace" class="virtual-space"></div>
           <div id="virtualRows" class="virtual-rows"></div>
-          <div id="emptyState" class="empty-state">正在准备日志数据…</div>
+          <div id="emptyState" class="empty-state">暂无日志，通过“文件 → 打开日志文件…”或 Ctrl+O 导入</div>
+        </div>
         </div>
       </section>
 
       <footer class="page-footer">
         <span id="statusDot" class="status-dot" aria-hidden="true"></span>
-        <span id="statusText" role="status" aria-live="polite">启动百万条双文件演示…</span>
+        <span id="statusText" role="status" aria-live="polite">就绪，请打开日志文件</span>
         <span class="footer-note">每次只渲染可见行；关键字会在结果中高亮</span>
       </footer>
     </main>
